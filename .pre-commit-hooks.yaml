@@ -1,0 +1,6 @@
+- id: mailguard
+  name: mailguard
+  description: Grade a domain's email anti-spoofing posture (SPF, DKIM, DMARC, MTA-STS).
+  entry: mailguard
+  language: python
+  pass_filenames: false
