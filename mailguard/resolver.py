@@ -11,7 +11,7 @@ from . import __version__
 
 USER_AGENT = f"mailguard/{__version__} (+https://github.com/njuj/mailguard)"
 DEFAULT_ENDPOINT = "https://dns.google/resolve"
-TYPES = {"A": 1, "TXT": 16, "MX": 15, "CNAME": 5}
+TYPES = {"A": 1, "AAAA": 28, "TXT": 16, "MX": 15, "CNAME": 5}
 # RFC 1035 response codes we care about.
 NXDOMAIN = 3
 

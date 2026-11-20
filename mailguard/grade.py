@@ -13,7 +13,9 @@ def score(checks: list[Check]) -> int:
 def grade(checks: list[Check]) -> str:
     by_id = {c.id: c for c in checks}
     # A domain with neither a usable SPF policy nor DMARC enforcement is trivially spoofable: cap at F.
-    spf_blocks = by_id.get("spf-policy") and by_id["spf-policy"].status == "pass"
+    # an SPF record that ends in permerror blocks nothing, whatever its 'all' says
+    spf_broken = any(by_id.get(i) and by_id[i].status == FAIL for i in ("spf-lookups", "spf-eval"))
+    spf_blocks = by_id.get("spf-policy") and by_id["spf-policy"].status == "pass" and not spf_broken
     dmarc_enforces = by_id.get("dmarc-policy") and by_id["dmarc-policy"].status in ("pass", "warn")
     if not spf_blocks and not dmarc_enforces:
         return "F"

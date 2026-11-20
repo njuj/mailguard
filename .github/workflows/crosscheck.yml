@@ -1,0 +1,26 @@
+name: crosscheck
+
+# Live check against the reference SPF implementation. Network-heavy, so it runs on demand, not per push.
+on:
+  workflow_dispatch:
+    inputs:
+      top:
+        description: how many Tranco top domains
+        default: "1000"
+
+jobs:
+  pyspf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install pyspf dnspython
+      - name: Tranco top domains
+        run: |
+          curl -sSL -o top.zip https://tranco-list.eu/top-1m.csv.zip
+          unzip -p top.zip | head -n "${{ inputs.top }}" | cut -d, -f2 > domains.txt
+          wc -l domains.txt
+      - name: mailguard vs pyspf
+        run: python scripts/crosscheck.py domains.txt

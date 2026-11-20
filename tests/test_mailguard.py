@@ -34,6 +34,30 @@ def txt(domain, *records):
     return {(domain, "TXT"): list(records)}
 
 
+def rsa_key(bits, spki=True):
+    """A DKIM p= value holding an RSA public key of exactly `bits` bits (DER built by hand, no crypto lib)."""
+    import base64
+
+    def der(tag, body):
+        n = len(body)
+        size = bytes([n]) if n < 128 else bytes([0x80 | ((n.bit_length() + 7) // 8)]) + n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([tag]) + size + body
+
+    modulus = (1 << (bits - 1)) | 1
+    rsa = der(0x30, der(0x02, b"\x00" + modulus.to_bytes(bits // 8, "big")) + der(0x02, b"\x01\x00\x01"))
+    if spki:
+        algo = der(0x30, der(0x06, bytes.fromhex("2a864886f70d010101")) + b"\x05\x00")
+        rsa = der(0x30, algo + der(0x03, b"\x00" + rsa))
+    return base64.b64encode(rsa).decode()
+
+
+def policy(text):
+    return lambda domain: (text, None)
+
+
+STS = "version: STSv1\nmode: enforce\nmx: *.mail.example.com\nmax_age: 604800\n"
+
+
 def by_id(checks):
     return {c.id: c for c in checks}
 
@@ -53,10 +77,10 @@ class SPFLookupCountTest(unittest.TestCase):
     def test_counts_recursively_and_catches_over_limit(self):
         zone = {
             **txt("example.com", "v=spf1 a include:_spf.google.com include:servers.example.net ~all"),
-            **txt("_spf.google.com", "v=spf1 include:_n1 include:_n2 include:_n3 ~all"),
-            **txt("_n1", "v=spf1 ip4:1.0.0.0/8 ~all"),
-            **txt("_n2", "v=spf1 ip4:2.0.0.0/8 ~all"),
-            **txt("_n3", "v=spf1 ip4:3.0.0.0/8 ~all"),
+            **txt("_spf.google.com", "v=spf1 include:_n1.google.com include:_n2.google.com include:_n3.google.com ~all"),
+            **txt("_n1.google.com", "v=spf1 ip4:1.0.0.0/8 ~all"),
+            **txt("_n2.google.com", "v=spf1 ip4:2.0.0.0/8 ~all"),
+            **txt("_n3.google.com", "v=spf1 ip4:3.0.0.0/8 ~all"),
             **txt("servers.example.net", "v=spf1 a mx include:deep.example.net -all"),
             **txt("deep.example.net", "v=spf1 a a:x.example.net mx ptr exists:%{i}._spf.example.net -all"),
         }
@@ -83,9 +107,11 @@ class SPFLookupCountTest(unittest.TestCase):
         self.assertEqual(spf.all_qualifier, "-")
 
     def test_void_lookups(self):
-        zone = {**txt("a.com", "v=spf1 include:missing1 include:missing2 include:missing3 -all")}
+        zone = {**txt("a.com", "v=spf1 include:missing1.example.net include:missing2.example.net include:missing3.example.net -all")}
         spf = evaluate_spf("a.com", zone[("a.com", "TXT")], FakeResolver(zone))
         self.assertEqual(spf.void_lookups, 3)
+        # an include of a domain without SPF is already a permerror on its own (RFC 7208 §5.2)
+        self.assertIn("missing1.example.net has no SPF record", spf.permerror)
 
 
 class ChecksTest(unittest.TestCase):
@@ -144,13 +170,75 @@ class ChecksTest(unittest.TestCase):
         self.assertIn("wildcard", c.detail)
 
     def test_mta_sts(self):
-        self.assertEqual(self.checks(mta_sts="v=STSv1; id=20260101")["mta-sts"].status, PASS)
+        base = dict(mta_sts="v=STSv1; id=20260101", mx=["a.mail.example.com"])
+        self.assertEqual(self.checks(**base, mta_sts_policy=STS)["mta-sts"].status, PASS)
         self.assertEqual(self.checks()["mta-sts"].status, INFO)
+        # TXT without a reachable policy file: senders ignore MTA-STS
+        c = self.checks(**base, mta_sts_error="answers HTTP 404")["mta-sts"]
+        self.assertEqual((c.status, c.penalty), (FAIL, 8))
+        # enforce with an MX the policy doesn't cover breaks delivery; "*." matches exactly one label
+        c = self.checks(**dict(base, mx=["a.b.mail.example.com"]), mta_sts_policy=STS)["mta-sts"]
+        self.assertEqual((c.status, c.penalty), (FAIL, 15))
+        self.assertIn("a.b.mail.example.com", c.detail)
+        testing = STS.replace("enforce", "testing")
+        self.assertEqual(self.checks(**base, mta_sts_policy=testing)["mta-sts"].status, WARN)
+        self.assertEqual(self.checks(**base, mta_sts_policy="version: STSv1\nmode: enforce\n")["mta-sts"].status, FAIL)
+        short = self.checks(**base, mta_sts_policy=STS.replace("604800", "3600"))["mta-sts"]
+        self.assertEqual(short.status, WARN)
+        self.assertIn("max_age", short.detail)
+        self.assertEqual(self.checks(**base, mta_sts_policy=STS.replace("enforce", "none"))["mta-sts"].status, INFO)
+
+    def test_tls_rpt(self):
+        self.assertEqual(self.checks(tls_rpt=["v=TLSRPTv1; rua=mailto:t@x.com"])["tls-rpt"].status, PASS)
+        self.assertEqual(self.checks(mta_sts="v=STSv1; id=1")["tls-rpt"].status, INFO)
+        self.assertNotIn("tls-rpt", self.checks())
+
+    def test_dkim_key_size(self):
+        from mailguard.checks import dkim_key_bits
+        self.assertEqual(dkim_key_bits(f"v=DKIM1; k=rsa; p={rsa_key(2048)}"), 2048)
+        self.assertEqual(dkim_key_bits(f"v=DKIM1; p={rsa_key(1024, spki=False)}"), 1024)
+        self.assertEqual(dkim_key_bits("v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="), "ed25519")
+        self.assertIsNone(dkim_key_bits("v=DKIM1; p=not base64!"))
+        keys = lambda bits: dict(dkim_selectors={"s1": True}, dkim_keys={"s1": f"v=DKIM1; p={rsa_key(bits)}"})
+        self.assertEqual(self.checks(**keys(2048))["dkim"].status, PASS)
+        self.assertEqual((self.checks(**keys(1024))["dkim"].status, self.checks(**keys(1024))["dkim"].penalty), (WARN, 3))
+        self.assertEqual((self.checks(**keys(512))["dkim"].status, self.checks(**keys(512))["dkim"].penalty), (FAIL, 10))
+
+    def test_dmarc_validation(self):
+        c = self.checks(dmarc_records=["v=DMARC1; p=block"])
+        self.assertEqual((c["dmarc"].status, c["dmarc-policy"].status), (FAIL, INFO))
+        self.assertEqual(self.checks(dmarc_records=["v=DMARC1; rua=mailto:a@x.com"])["dmarc"].status, FAIL)
+        self.assertEqual(self.checks(dmarc_records=["v=DMARC1; p=reject; rua=https://x.com/r"])["dmarc-rua"].status, WARN)
+        rec = ["v=DMARC1; p=reject; rua=mailto:d@reports.example.net"]
+        dropped = self.checks(dmarc_records=rec, dmarc_external={"reports.example.net": False})["dmarc-rua"]
+        self.assertEqual(dropped.status, WARN)
+        self.assertIn("example.com._report._dmarc.reports.example.net", dropped.detail)
+        ok = self.checks(dmarc_records=rec, dmarc_external={"reports.example.net": True})["dmarc-rua"]
+        self.assertEqual(ok.status, PASS)
+
+    def test_report_domains(self):
+        from mailguard.checks import report_domains
+        tags = parse_dmarc("v=DMARC1; p=none; rua=mailto:a@example.com,mailto:b@x.vendor.net!10m; "
+                           "ruf=mailto:c@mail.example.com,mailto:d@vendor.org")
+        self.assertEqual(report_domains("example.com", tags), ["x.vendor.net", "vendor.org"])
+        # a subdomain reporting to its parent is the same owner
+        self.assertEqual(report_domains("eu.example.com", {"rua": "mailto:r@example.com"}), [])
+
+    def test_spf_eval(self):
+        from mailguard.model import SPFResult
+        broken = SPFResult("v=spf1 include:gone.example -all", "-", 1, permerror="include:gone.example has no SPF record")
+        c = self.checks(spf_records=[broken.record], spf=broken)["spf-eval"]
+        self.assertEqual((c.status, c.penalty), (FAIL, 25))
+        self.assertIn("gone.example", c.detail)
+        huge = SPFResult("v=spf1 ip4:0.0.0.0/1 -all", "-", 0, ipv4_addresses=1 << 31)
+        self.assertEqual(self.checks(spf_records=[huge.record], spf=huge)["spf-eval"].status, WARN)
+        ptr = SPFResult("v=spf1 ptr -all", "-", 1, uses_ptr=True)
+        self.assertEqual(self.checks(spf_records=[ptr.record], spf=ptr)["spf-eval"].status, WARN)
 
 
 class GradeTest(unittest.TestCase):
-    def from_zone(self, zone):
-        return audit("example.com", FakeResolver(zone))[1]
+    def from_zone(self, zone, sts=STS):
+        return audit("example.com", FakeResolver(zone), fetch=policy(sts))[1]
 
     def test_hardened_domain_is_a_plus(self):
         zone = {
@@ -158,10 +246,19 @@ class GradeTest(unittest.TestCase):
             **txt("_spf.example.com", "v=spf1 ip4:1.2.3.4 -all"),
             **txt("_dmarc.example.com", "v=DMARC1; p=reject; rua=mailto:dmarc@example.com; adkim=s; aspf=s"),
             **txt("_mta-sts.example.com", "v=STSv1; id=20260101T000000Z"),
-            **txt("google._domainkey.example.com", "v=DKIM1; k=rsa; p=MIGfMA0..."),
+            **txt("google._domainkey.example.com", f"v=DKIM1; k=rsa; p={rsa_key(2048)}"),
+            **txt("_smtp._tls.example.com", "v=TLSRPTv1; rua=mailto:tls@example.com"),
+            ("example.com", "MX"): ["a.mail.example.com"],
         }
         checks = self.from_zone(zone)
         self.assertEqual((grade(checks), score(checks)), ("A+", 100))
+        # the same domain with an enforce policy that doesn't list its MX loses the A+
+        self.assertNotEqual(grade(self.from_zone(zone, STS.replace("*.mail", "*.other"))), "A+")
+
+    def test_spf_permerror_counts_as_no_spf(self):
+        # -all looks strict, but the include has no SPF record, so receivers see permerror: no SPF at all
+        zone = {**txt("example.com", "v=spf1 include:gone.example.net -all")}
+        self.assertEqual(grade(self.from_zone(zone)), "F")
 
     def test_wide_open_domain_is_f(self):
         self.assertEqual(grade(self.from_zone({})), "F")
@@ -191,6 +288,84 @@ class GradeTest(unittest.TestCase):
     def test_grade_order(self):
         self.assertTrue(at_least("A+", "B"))
         self.assertFalse(at_least("D", "B"))
+
+
+class SPFSyntaxTest(unittest.TestCase):
+    def permerror(self, record, extra=None):
+        return evaluate_spf("example.com", [record], FakeResolver({**txt("example.com", record), **(extra or {})})).permerror
+
+    def test_syntax_errors(self):
+        self.assertIsNone(self.permerror("v=spf1 ip4:192.0.2.0/24 -all"))
+        self.assertIn("unknown term", self.permerror("v=spf1 ip:192.0.2.1 -all"))
+        self.assertIn("invalid", self.permerror("v=spf1 ip4:192.0.2.300 -all"))
+        self.assertIn("invalid", self.permerror("v=spf1 ip4:2001:db8::1 -all"))
+        self.assertIn("invalid", self.permerror("v=spf1 a/33 -all"))
+        self.assertIn("takes no argument", self.permerror("v=spf1 all:x -all"))
+        self.assertIn("needs a valid domain", self.permerror("v=spf1 include:localhost -all"))
+        self.assertIn("twice", self.permerror("v=spf1 redirect=a.example.net redirect=b.example.net"))
+        self.assertIsNone(self.permerror("v=spf1 include:%{d}.example.net -all"))   # macros can't be followed
+
+    def test_mx_limit_and_void(self):
+        mx = {("example.com", "MX"): [f"mx{i}.example.com" for i in range(11)]}
+        self.assertIn("11 MX hosts", self.permerror("v=spf1 mx -all", mx))
+        # three a:/exists: terms that resolve to nothing pass the void limit of 2
+        self.assertIn("void", self.permerror("v=spf1 a:x1.example.net a:x2.example.net exists:x3.example.net -all"))
+
+    def test_redirect_only_without_all(self):
+        zone = txt("_spf.example.net", "v=spf1 ip4:192.0.2.0/24 -all")
+        r = evaluate_spf("example.com", ["v=spf1 redirect=_spf.example.net"], FakeResolver(zone))
+        self.assertEqual((r.all_qualifier, r.lookups, r.ipv4_addresses), ("-", 1, 256))
+        r = evaluate_spf("example.com", ["v=spf1 ~all redirect=_spf.example.net"], FakeResolver(zone))
+        self.assertEqual((r.all_qualifier, r.lookups), ("~", 0))
+
+    def test_costs_and_address_space(self):
+        zone = {**txt("big.example.net", "v=spf1 include:a.example.net include:b.example.net -all"),
+                **txt("a.example.net", "v=spf1 ip4:10.0.0.0/8 -all"),
+                **txt("b.example.net", "v=spf1 ip4:10.1.0.0/16 ip4:192.0.2.1 -all")}
+        r = evaluate_spf("example.com", ["v=spf1 include:big.example.net -all"], FakeResolver(zone))
+        self.assertEqual(r.costs, {"big.example.net": 3})
+        self.assertEqual(r.ipv4_addresses, (1 << 24) + 1)   # overlapping ranges counted once
+
+
+class FixTest(unittest.TestCase):
+    def fix(self, zone, sts=None):
+        from mailguard.fix import render
+        snap = gather("example.com", FakeResolver(zone), fetch=policy(sts))
+        return render(snap, today="20260101")
+
+    def test_open_domain_gets_staged_records(self):
+        out = self.fix({("example.com", "MX"): ["mx1.mail.example.com", "mx2.mail.example.com"]})
+        self.assertIn('@                        IN TXT "v=spf1 mx -all"', out)
+        self.assertIn('_dmarc                   IN TXT "v=DMARC1; p=none; rua=mailto:dmarc-reports@example.com"', out)
+        self.assertIn('_mta-sts                 IN TXT "v=STSv1; id=20260101"', out)
+        self.assertIn("; mx: mx2.mail.example.com", out)
+        self.assertIn("_smtp._tls", out)
+
+    def test_no_mail_domain_gets_null_mx(self):
+        out = self.fix({})
+        self.assertIn('"v=spf1 -all"', out)
+        self.assertIn("p=reject", out)
+        self.assertIn("IN MX 0 .", out)
+        self.assertNotIn("_mta-sts", out)
+
+    def test_tightens_existing_records(self):
+        zone = {**txt("example.com", "v=spf1 include:_spf.example.net ~all"),
+                **txt("_spf.example.net", "v=spf1 ip4:192.0.2.0/24 -all"),
+                **txt("_dmarc.example.com", "v=DMARC1; p=quarantine; rua=mailto:d@reports.example.net; adkim=s"),
+                ("example.com", "MX"): ["a.mail.example.com"]}
+        out = self.fix(zone)
+        self.assertIn('"v=spf1 include:_spf.example.net -all"', out)
+        self.assertIn('"v=DMARC1; p=reject; rua=mailto:d@reports.example.net; adkim=s"', out)
+        self.assertIn('example.com._report._dmarc.reports.example.net. IN TXT "v=DMARC1"', out)
+
+    def test_clean_domain_needs_nothing(self):
+        zone = {**txt("example.com", "v=spf1 mx -all"),
+                **txt("_dmarc.example.com", "v=DMARC1; p=reject; rua=mailto:d@example.com"),
+                **txt("_mta-sts.example.com", "v=STSv1; id=1"),
+                **txt("_smtp._tls.example.com", "v=TLSRPTv1; rua=mailto:t@example.com"),
+                ("example.com", "MX"): ["a.mail.example.com"],
+                ("a.mail.example.com", "A"): ["192.0.2.1"]}
+        self.assertEqual(self.fix(zone, STS), "; example.com: nothing to change\n")
 
 
 class ScannerTest(unittest.TestCase):
@@ -246,6 +421,10 @@ class CLITest(unittest.TestCase):
         code, out, _ = self.run_cli("open.com", "--json", zone=zone)
         self.assertEqual((code, json.loads(out)["reports"][0]["grade"]), (0, "F"))
         self.assertEqual(self.run_cli("open.com", "--min-grade", "C", zone=zone)[0], 1)
+
+    def test_fix_flag(self):
+        code, out, _ = self.run_cli("open.com", "--json", "--fix")
+        self.assertIn("IN MX 0 .", json.loads(out)["reports"][0]["fix"])
 
     def test_text_output(self):
         zone = {**txt("example.com", "v=spf1 -all"),

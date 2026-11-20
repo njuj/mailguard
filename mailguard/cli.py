@@ -10,6 +10,7 @@ import time
 from dataclasses import asdict
 
 from . import __version__
+from . import fix as fixer
 from .grade import GRADES, at_least, grade, score
 from .model import FAIL, INFO, PASS, WARN
 from .resolver import DEFAULT_ENDPOINT, Resolver
@@ -32,18 +33,27 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--resolver", default=DEFAULT_ENDPOINT, metavar="URL",
                     help="DNS-over-HTTPS endpoint (default: Google)")
     ap.add_argument("--timeout", type=float, default=10, metavar="S", help="per-query timeout (default: 10)")
+    ap.add_argument("--fix", action="store_true",
+                    help="print the DNS records (zone-file syntax) and MTA-STS policy that fix what was found")
     ap.add_argument("--no-color", action="store_true", help="disable ANSI colours")
     ap.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     return ap
 
 
-def report(domain: str, resolver: Resolver) -> dict:
+def report(domain: str, resolver: Resolver, fix: bool = False) -> dict:
     snap, checks = audit(domain, resolver)
-    return {"domain": snap.domain, "grade": grade(checks), "score": score(checks),
-            "spf": {"record": snap.spf.record, "lookups": snap.spf.lookups, "all": snap.spf.all_qualifier,
-                    "includes": snap.spf.includes} if snap.spf else None,
-            "dmarc": snap.dmarc, "mx": snap.mx, "errors": snap.errors,
-            "checks": [asdict(c) for c in checks]}
+    spf = snap.spf
+    rep = {"domain": snap.domain, "grade": grade(checks), "score": score(checks),
+           "spf": {"record": spf.record, "lookups": spf.lookups, "all": spf.all_qualifier,
+                   "includes": spf.includes, "costs": spf.costs, "permerror": spf.permerror,
+                   "void_lookups": spf.void_lookups, "ipv4_addresses": spf.ipv4_addresses} if spf else None,
+           "dmarc": snap.dmarc, "dmarc_external": snap.dmarc_external, "mx": snap.mx,
+           "mta_sts": {"record": snap.mta_sts, "policy": snap.mta_sts_policy, "error": snap.mta_sts_error}
+           if snap.mta_sts else None,
+           "tls_rpt": snap.tls_rpt, "errors": snap.errors, "checks": [asdict(c) for c in checks]}
+    if fix:
+        rep["fix"] = fixer.render(snap)
+    return rep
 
 
 def _glyphs(stream) -> dict:
@@ -80,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     reports, failed = [], False
     for domain in args.domains:
         try:
-            reports.append(report(domain, resolver))
+            reports.append(report(domain, resolver, args.fix))
         except Exception as e:  # noqa: BLE001 — one bad domain should not sink the batch
             print(f"mailguard: {domain}: {e}", file=sys.stderr)
             failed = True
@@ -94,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         glyphs = _glyphs(sys.stdout)
         for rep in reports:
             print(render(rep, color, glyphs))
+            if "fix" in rep:
+                print(rep["fix"])
 
     if failed:
         return 2
