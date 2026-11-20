@@ -45,8 +45,8 @@ def check_spf_presence(s: Snapshot) -> Check:
 
 
 def _costliest(s: Snapshot) -> str:
-    top = sorted(s.spf.costs.items(), key=lambda kv: -kv[1])[:3]
-    return f" (costliest: {', '.join(f'{k} {v}' for k, v in top)})" if top and top[0][1] > 1 else ""
+    top = sorted(s.spf.costs.items(), key=lambda kv: -kv[1])[:2]
+    return f"; costliest: {', '.join(f'{k} {v}' for k, v in top)}" if top and top[0][1] > 1 else ""
 
 
 def check_spf_lookups(s: Snapshot) -> Check:
@@ -60,7 +60,7 @@ def check_spf_lookups(s: Snapshot) -> Check:
                      f"receivers drop SPF: the record looks fine but does nothing{_costliest(s)}", 25)
     if n >= 8:
         return Check("spf-lookups", title, WARN,
-                     f"uses {n} of 10 DNS lookups; one more include tips it into permerror{_costliest(s)}", 8)
+                     f"{n} of 10 DNS lookups, one include from permerror{_costliest(s)}", 8)
     return Check("spf-lookups", title, PASS, f"{n} of 10 DNS lookups")
 
 
@@ -191,12 +191,13 @@ def check_dkim(s: Snapshot) -> Check:
         weakest = min(rsa.items(), key=lambda kv: kv[1]) if rsa else None
         listed = ", ".join(f"{sel} ({sizes[sel]}{'-bit' if isinstance(sizes.get(sel), int) else ''})"
                            if sizes.get(sel) else sel for sel in found)
+        weak = ", ".join(sel for sel, b in rsa.items() if b == weakest[1]) if weakest else ""
         if weakest and weakest[1] < 1024:
-            return Check("dkim", title, FAIL, f"selector {weakest[0]} has a {weakest[1]}-bit RSA key: receivers "
-                                              f"must treat keys under 1024 bits as invalid (RFC 8301); {listed}", 10)
+            return Check("dkim", title, FAIL, f"{weakest[1]}-bit RSA key at {weak}: receivers must ignore keys "
+                                              "under 1024 bits (RFC 8301)", 10)
         if weakest and weakest[1] < 2048:
-            return Check("dkim", title, WARN, f"selector {weakest[0]} uses a {weakest[1]}-bit RSA key, the minimum "
-                                              f"allowed; rotate to 2048 bits. Keys: {listed}", 3)
+            return Check("dkim", title, WARN, f"{weakest[1]}-bit RSA key at {weak}, the minimum allowed; "
+                                              f"rotate to 2048 ({len(found)} live keys)", 3)
         return Check("dkim", title, PASS, f"live key found at selector(s): {listed}")
     return Check("dkim", title, INFO,
                  "no key at common selectors; DKIM may still use a custom selector we can't guess")

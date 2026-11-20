@@ -379,6 +379,14 @@ class FixTest(unittest.TestCase):
         self.assertIn('"v=DMARC1; p=reject; rua=mailto:d@reports.example.net; adkim=s"', out)
         self.assertIn('example.com._report._dmarc.reports.example.net. IN TXT "v=DMARC1"', out)
 
+    def test_drops_an_include_that_matches_everyone(self):
+        zone = {**txt("example.com", "v=spf1 ~include:open.example.net include:_spf.example.net -all"),
+                **txt("open.example.net", "v=spf1 +all"),
+                **txt("_spf.example.net", "v=spf1 ip4:198.51.100.0/24 -all")}
+        out = self.fix(zone)
+        self.assertIn("remove ~include:open.example.net", out)
+        self.assertIn('"v=spf1 include:_spf.example.net -all"', out)
+
     def test_clean_domain_needs_nothing(self):
         zone = {**txt("example.com", "v=spf1 mx -all"),
                 **txt("_dmarc.example.com", "v=DMARC1; p=reject; rua=mailto:d@example.com"),

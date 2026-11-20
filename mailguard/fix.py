@@ -52,8 +52,16 @@ def _spf(s: Snapshot) -> list[str]:
                    f"ip4:/ip6: ranges: {top}")
     elif spf and spf.permerror:
         out.append(f"; SPF: fix the permerror first: {spf.permerror}")
-    if spf and spf.all_qualifier != "-":
-        terms = [t for t in record.split() if t.lstrip("+-~?").lower() != "all"]
+    drop = None
+    if spf and spf.matched:
+        term, _, where = spf.matched.partition(" at ")
+        if where == s.domain:
+            drop = term
+            out.append(f"; SPF: remove {term}: it matches every sender, so nothing after it counts")
+        else:
+            out.append(f"; SPF: {spf.matched} matches every sender; remove the include that leads there")
+    if spf and (spf.all_qualifier != "-" or drop):
+        terms = [t for t in record.split() if t.lstrip("+-~?").lower() != "all" and t != drop]
         if not any(t.lower().startswith("redirect=") for t in terms):
             out += ["; SPF: end in -all so receivers reject mail from servers you did not list",
                     _txt("@", " ".join(terms + ["-all"]))]
@@ -99,11 +107,11 @@ def recommend(s: Snapshot, today: str | None = None) -> list[str]:
             out += [f"; in the zone of {dest} (not yours), so it accepts your DMARC reports:",
                     _txt(f"{s.domain}._report._dmarc.{dest}.", "v=DMARC1")]
     out += _mta_sts(s, today)
-    for sel, rec in s.dkim_keys.items():
-        bits = dkim_key_bits(rec)
-        if isinstance(bits, int) and bits < 2048:
-            out.append(f"; DKIM: selector {sel} is {bits}-bit; publish a 2048-bit key under a new selector, "
-                       "sign with it, then revoke the old one with p=")
+    weak = [f"{sel} ({bits})" for sel, bits in ((sel, dkim_key_bits(rec)) for sel, rec in s.dkim_keys.items())
+            if isinstance(bits, int) and bits < 2048]
+    if weak:
+        out.append(f"; DKIM: short RSA keys at {', '.join(weak)}; publish a 2048-bit key under a new selector, "
+                   "sign with it, then revoke the old one with an empty p=")
     return out
 
 
