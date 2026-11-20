@@ -295,15 +295,35 @@ class SPFSyntaxTest(unittest.TestCase):
         return evaluate_spf("example.com", [record], FakeResolver({**txt("example.com", record), **(extra or {})})).permerror
 
     def test_syntax_errors(self):
-        self.assertIsNone(self.permerror("v=spf1 ip4:192.0.2.0/24 -all"))
-        self.assertIn("unknown term", self.permerror("v=spf1 ip:192.0.2.1 -all"))
-        self.assertIn("invalid", self.permerror("v=spf1 ip4:192.0.2.300 -all"))
+        self.assertIsNone(self.permerror("v=spf1 ip4:198.51.100.0/24 -all"))
+        self.assertIn("unknown term", self.permerror("v=spf1 ip:198.51.100.1 -all"))
+        self.assertIn("invalid", self.permerror("v=spf1 ip4:198.51.100.300 -all"))
         self.assertIn("invalid", self.permerror("v=spf1 ip4:2001:db8::1 -all"))
         self.assertIn("invalid", self.permerror("v=spf1 a/33 -all"))
         self.assertIn("takes no argument", self.permerror("v=spf1 all:x -all"))
         self.assertIn("needs a valid domain", self.permerror("v=spf1 include:localhost -all"))
         self.assertIn("twice", self.permerror("v=spf1 redirect=a.example.net redirect=b.example.net"))
-        self.assertIsNone(self.permerror("v=spf1 include:%{d}.example.net -all"))   # macros can't be followed
+        self.assertIn("malformed macro", self.permerror("v=spf1 exists:%{x}.example.net -all"))
+
+    def test_macros_are_expanded_for_the_test_sender(self):
+        from mailguard.spf import expand
+        self.assertEqual(expand("%{ir}.%{v}.%{d}.spf.has.pphosted.com", "ex.com"),
+                         "1.2.0.192.in-addr.ex.com.spf.has.pphosted.com")
+        self.assertEqual(expand("%{l}.%{o}.%{d2}.%{s}", "a.b.ex.com"), "postmaster.a.b.ex.com.ex.com.postmaster@a.b.ex.com")
+        self.assertEqual(expand("%{h}%%%_%-", "ex.com"), "ex.com% %20")
+        # a per-IP include that has no record for an unknown sender is a permerror for every spoofer
+        self.assertIn("1.2.0.192.ex.net has no SPF record", self.permerror("v=spf1 include:%{ir}.ex.net -all"))
+        ok = {**txt("192.0.2.1._ip.ex.net", "v=spf1 -all")}
+        self.assertIsNone(self.permerror("v=spf1 include:%{i}._ip.ex.net -all", ok))
+
+    def test_stops_at_an_included_pass_all(self):
+        zone = {**txt("open.example.net", "v=spf1 +all"), **txt("later.example.net", "v=spf1 -all")}
+        r = evaluate_spf("example.com", ["v=spf1 ~include:open.example.net include:later.example.net -all"],
+                         FakeResolver(zone))
+        self.assertEqual((r.all_qualifier, r.lookups), ("~", 1))      # later.example.net is never reached
+        self.assertIn("open.example.net", r.matched)
+        r = evaluate_spf("example.com", ["v=spf1 include:open.example.net -all"], FakeResolver(zone))
+        self.assertEqual(r.all_qualifier, "+")
 
     def test_mx_limit_and_void(self):
         mx = {("example.com", "MX"): [f"mx{i}.example.com" for i in range(11)]}
@@ -312,7 +332,7 @@ class SPFSyntaxTest(unittest.TestCase):
         self.assertIn("void", self.permerror("v=spf1 a:x1.example.net a:x2.example.net exists:x3.example.net -all"))
 
     def test_redirect_only_without_all(self):
-        zone = txt("_spf.example.net", "v=spf1 ip4:192.0.2.0/24 -all")
+        zone = txt("_spf.example.net", "v=spf1 ip4:198.51.100.0/24 -all")
         r = evaluate_spf("example.com", ["v=spf1 redirect=_spf.example.net"], FakeResolver(zone))
         self.assertEqual((r.all_qualifier, r.lookups, r.ipv4_addresses), ("-", 1, 256))
         r = evaluate_spf("example.com", ["v=spf1 ~all redirect=_spf.example.net"], FakeResolver(zone))
@@ -321,9 +341,10 @@ class SPFSyntaxTest(unittest.TestCase):
     def test_costs_and_address_space(self):
         zone = {**txt("big.example.net", "v=spf1 include:a.example.net include:b.example.net -all"),
                 **txt("a.example.net", "v=spf1 ip4:10.0.0.0/8 -all"),
-                **txt("b.example.net", "v=spf1 ip4:10.1.0.0/16 ip4:192.0.2.1 -all")}
+                **txt("b.example.net", "v=spf1 ip4:10.1.0.0/16 ip4:198.51.100.1 -all")}
         r = evaluate_spf("example.com", ["v=spf1 include:big.example.net -all"], FakeResolver(zone))
         self.assertEqual(r.costs, {"big.example.net": 3})
+        self.assertIsNone(r.matched)
         self.assertEqual(r.ipv4_addresses, (1 << 24) + 1)   # overlapping ranges counted once
 
 
@@ -350,7 +371,7 @@ class FixTest(unittest.TestCase):
 
     def test_tightens_existing_records(self):
         zone = {**txt("example.com", "v=spf1 include:_spf.example.net ~all"),
-                **txt("_spf.example.net", "v=spf1 ip4:192.0.2.0/24 -all"),
+                **txt("_spf.example.net", "v=spf1 ip4:198.51.100.0/24 -all"),
                 **txt("_dmarc.example.com", "v=DMARC1; p=quarantine; rua=mailto:d@reports.example.net; adkim=s"),
                 ("example.com", "MX"): ["a.mail.example.com"]}
         out = self.fix(zone)
@@ -364,7 +385,7 @@ class FixTest(unittest.TestCase):
                 **txt("_mta-sts.example.com", "v=STSv1; id=1"),
                 **txt("_smtp._tls.example.com", "v=TLSRPTv1; rua=mailto:t@example.com"),
                 ("example.com", "MX"): ["a.mail.example.com"],
-                ("a.mail.example.com", "A"): ["192.0.2.1"]}
+                ("a.mail.example.com", "A"): ["198.51.100.1"]}
         self.assertEqual(self.fix(zone, STS), "; example.com: nothing to change\n")
 
 

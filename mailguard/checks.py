@@ -8,6 +8,7 @@ import re
 
 from .model import FAIL, INFO, PASS, WARN, Check, Snapshot
 
+RESULT = {"-": "fail", "~": "softfail", "?": "neutral", "+": "pass"}
 SHARED_SPACE = 1 << 24      # an SPF record authorizing more than a /8 lets whole cloud regions send as you
 
 # Selectors probed to see whether DKIM is set up at all. We cannot enumerate selectors over DNS,
@@ -80,6 +81,15 @@ def check_spf_eval(s: Snapshot) -> Check | None:
         return Check("spf-eval", title, FAIL, f"permerror: {s.spf.permerror}; receivers ignore this SPF record", 25)
     if s.spf.permerror:
         return None                                     # the lookup check already says it
+    if s.spf.matched:
+        q = s.spf.all_qualifier
+        if q == "+":
+            return Check("spf-eval", title, FAIL, f"{s.spf.matched} matches every sender (it includes a record "
+                                                  "that ends in +all, or a range covering everyone): SPF passes "
+                                                  "anyone who sends as you", 30)
+        return Check("spf-eval", title, WARN, f"{s.spf.matched} matches every sender, so evaluation stops there "
+                                              f"and the result is {RESULT.get(q, q)} for everyone; nothing after "
+                                              "it, 'all' included, is ever reached", 5)
     space = s.spf.ipv4_addresses
     allowed = f"authorizes {space:,} IPv4 addresses" if space else "no IPv4 addresses resolved"
     if space > SHARED_SPACE:

@@ -19,6 +19,7 @@ class SPFResult:
     costs: dict[str, int] = field(default_factory=dict)      # each top-level include/redirect -> lookups
     uses_ptr: bool = False              # the deprecated, slow ptr mechanism (RFC 7208 §5.5)
     ipv4_addresses: int = 0             # how many IPv4 addresses the record authorizes, includes resolved
+    matched: str | None = None          # a non-'all' term that matches any sender (e.g. an included +all)
 
 
 @dataclass

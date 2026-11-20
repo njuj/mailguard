@@ -6,8 +6,9 @@ return nothing. Going over either, a syntax error anywhere in the chain, an `inc
 no SPF record (§5.2), or an `mx` with more than 10 MX hosts all end in `permerror`, and most receivers
 treat permerror as "no SPF at all": the record is still there and still looks right, but it does nothing.
 
-The walk evaluates every term, as a receiver does for a sender that matches nothing, so every lookup
-the record can cost is counted.
+The walk is check_host() for a sender at 192.0.2.1 (TEST-NET-1, which nobody authorizes): what a receiver
+does for a spoofer. Macros (%{i}, %{ir}, %{d}, ...) are expanded for that sender, and the walk stops at the
+first mechanism that matches, so an included `+all` shows up as what it is: every sender matches.
 """
 
 from __future__ import annotations
@@ -28,6 +29,27 @@ MAX_DEPTH = 12  # defends against deliberately deep or cyclic include chains
 _MODIFIER = re.compile(r"^([a-z][a-z0-9_.-]*)=(.*)$", re.I)
 _CIDR = re.compile(r"^(.*?)(?:/(\d+))?(?://(\d+))?$")
 _LABEL = re.compile(r"^(?!-)[a-z0-9_-]{1,63}(?<!-)$", re.I)
+_MACRO = re.compile(r"%(?:\{([slodiphv])(\d*)(r?)([-.+,/_=]*)\}|[%_-])", re.I)
+SENDER_IP = ipaddress.ip_address("192.0.2.1")
+
+
+def expand(spec: str, domain: str) -> str | None:
+    """RFC 7208 §7 macro expansion for the test sender postmaster@<domain> at 192.0.2.1; None if malformed."""
+    values = {"s": f"postmaster@{domain}", "l": "postmaster", "o": domain, "d": domain, "i": str(SENDER_IP),
+              "p": "unknown", "v": "in-addr", "h": domain}
+
+    def one(m: re.Match) -> str:
+        if not m.group(1):
+            return {"%%": "%", "%_": " ", "%-": "%20"}[m.group(0)]
+        parts = re.split("[" + re.escape(m.group(4) or ".") + "]", values[m.group(1).lower()])
+        if m.group(3):
+            parts.reverse()
+        if m.group(2):
+            parts = parts[-int(m.group(2)):] if int(m.group(2)) else parts
+        return ".".join(parts)
+
+    out = _MACRO.sub(one, spec)
+    return None if "%" in _MACRO.sub("", spec) else out
 
 
 def find_spf(txt_records: list[str]) -> list[str]:
@@ -67,6 +89,7 @@ class _Walker:
         self.permerror: str | None = None           # the first reason the whole evaluation is a permerror
         self.ptr = False
         self.ip4: list[ipaddress.IPv4Network] = []
+        self.matched: str | None = None             # a mechanism other than 'all' that matched the test sender
 
     def fail(self, reason: str) -> None:
         if self.permerror is None:
@@ -91,8 +114,6 @@ class _Walker:
             self.errors.append(f"include loop or too deep at {domain}")
             self.fail(f"include loop at {domain}")
             return None
-        if "%" in domain:                           # macro: depends on the sender, can't be followed
-            return None
         records = self.query(domain, "TXT")
         if records is None:
             return None
@@ -105,9 +126,18 @@ class _Walker:
             self.fail(f"{domain} publishes {len(spf)} SPF records")
         return self.walk(spf[0], domain, depth, seen | {domain.lower()})
 
+    def target(self, spec: str, domain: str) -> str | None:
+        name = expand(spec, domain)
+        if name is None:
+            self.fail(f"{domain}: malformed macro in {spec!r}")
+        return name
+
     def walk(self, record: str, domain: str, depth: int, seen: frozenset[str]) -> str | None:
-        all_qualifier, redirect, exp = None, None, None
+        """check_host() for the test sender: the qualifier of the first mechanism that matches."""
+        all_qualifier, redirect, exp, result = None, None, None, None
         for term in record.split()[1:]:            # skip the v=spf1 token
+            if result is not None:                  # a receiver stops at the first match
+                break
             before = self.lookups
             mod = _MODIFIER.match(term)
             if mod and ":" not in mod.group(1):
@@ -130,29 +160,36 @@ class _Walker:
             if name == "all":
                 if value:
                     self.fail(f"{domain}: {term!r} takes no argument")
-                all_qualifier = qualifier or "+"
+                all_qualifier = result = qualifier or "+"
             elif name in ("ip4", "ip6"):
-                self._ip(domain, name, value, term)
+                if self._ip(domain, name, value, term):
+                    result = qualifier or "+"
+                    self.matched = self.matched or f"{term} at {domain}"
             elif name in ("include", "exists"):
                 if not value or not _domain_ok(value):
                     self.fail(f"{domain}: {term!r} needs a valid domain")
                     continue
                 self.lookups += 1
+                host = self.target(value, domain)
+                if host is None:
+                    continue
                 if name == "include":
                     self.includes.append(value)
-                    self.evaluate(value, depth + 1, seen, "include")
-                elif "%" not in value:
-                    self.charge(not self.query(value, "A"))
+                    if self.evaluate(host, depth + 1, seen, "include") == "+":   # included record passes
+                        result = qualifier or "+"
+                        self.matched = self.matched or f"{term} at {domain}"
+                else:
+                    self.charge(not self.query(host, "A"))
             else:                                   # a, mx, ptr with optional :domain and /cidr
                 target, v4, v6 = _CIDR.match(value).groups() if value else ("", None, None)
                 if (v4 and int(v4) > 32) or (v6 and int(v6) > 128) or (target and not _domain_ok(target)):
                     self.fail(f"{domain}: invalid {term!r}")
                     continue
                 self.lookups += 1
-                host = target or domain
+                host = self.target(target, domain) if target else domain
                 if name == "ptr":
                     self.ptr = True
-                elif "%" in host:
+                elif host is None:
                     pass
                 elif name == "a":
                     self._addresses(host, int(v4) if v4 else 32)
@@ -166,26 +203,29 @@ class _Walker:
                             self._addresses(mx, int(v4) if v4 else 32, void=False)
             if depth == 0 and name == "include" and value:
                 self.costs[value] = self.lookups - before
-        if redirect and all_qualifier is None:      # redirect only applies when there is no 'all'
+        if redirect and result is None and all_qualifier is None:   # redirect applies only when nothing matched
             before = self.lookups
             self.lookups += 1
             self.includes.append(f"redirect={redirect}")
-            result = self.evaluate(redirect, depth + 1, seen, "redirect")
+            host = self.target(redirect, domain)
+            result = self.evaluate(host, depth + 1, seen, "redirect") if host else None
             if depth == 0:
                 self.costs[f"redirect={redirect}"] = self.lookups - before
-            return result
-        return all_qualifier
+        return result
 
-    def _ip(self, domain: str, name: str, value: str, term: str) -> None:
+    def _ip(self, domain: str, name: str, value: str, term: str) -> bool:
+        """Record the network; True when it covers the test sender."""
         try:
             net = ipaddress.ip_network(value, strict=False)
         except ValueError:
             self.fail(f"{domain}: invalid {term!r}")
-            return
+            return False
         if (name == "ip4") != (net.version == 4) or "/" in value and not value.split("/")[1].isdigit():
             self.fail(f"{domain}: invalid {term!r}")
         elif net.version == 4:
             self.ip4.append(net)
+            return SENDER_IP in net
+        return False
 
     def _addresses(self, host: str, prefix: int, void: bool = True) -> None:
         addrs = self.query(host, "A")
@@ -210,6 +250,7 @@ def evaluate_spf(domain: str, records: list[str], resolver: Resolver) -> SPFResu
     all_qualifier = w.walk(spf[0], domain.lower(), 0, frozenset({domain.lower()}))
     if len(spf) > 1:
         w.errors.insert(0, "more than one SPF record (receivers reject this as permerror)")
+        w.permerror = f"{len(spf)} SPF records at {domain}; there must be exactly one"
     if w.lookups > HARD_LIMIT:
         w.permerror = f"{w.lookups} DNS lookups, over the limit of {HARD_LIMIT}"
     return SPFResult(
@@ -222,5 +263,6 @@ def evaluate_spf(domain: str, records: list[str], resolver: Resolver) -> SPFResu
         permerror=w.permerror,
         costs=w.costs,
         uses_ptr=w.ptr,
+        matched=w.matched,
         ipv4_addresses=sum(n.num_addresses for n in ipaddress.collapse_addresses(w.ip4)),
     )
