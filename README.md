@@ -7,6 +7,8 @@
 ![deps](https://img.shields.io/badge/dependencies-0-00ff9c?labelColor=0b0f17)
 ![license](https://img.shields.io/badge/license-MIT-00ff9c?labelColor=0b0f17)
 
+<p align="center"><img src="docs/banner.svg" width="100%" alt="mailguard: how it works"/></p>
+
 <p align="center"><img src="docs/demo.svg" width="100%" alt="mailguard running in a terminal"/></p>
 
 ```text
