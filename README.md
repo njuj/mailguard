@@ -1,6 +1,6 @@
 # mailguard
 
-[![Part of Cryptid Security](https://img.shields.io/badge/part_of-Cryptid%20Security-00ff9c?style=flat-square&labelColor=0d1117)](https://github.com/cryptid-security)
+[![Part of Cryptid Security](https://img.shields.io/badge/part_of-Cryptid%20Security-c6922f?style=flat-square&labelColor=0c1411)](https://github.com/cryptid-security)
 
 **Grade any domain's protection against email spoofing (SPF, DKIM, DMARC, MTA-STS) from DNS alone, then print the records that fix it.** mailguard evaluates SPF the way a receiving mail server does, checked against the reference implementation on the top 1,000 domains. It names the exact reason a record silently breaks and which include costs the most lookups. It fetches and checks your MTA-STS policy against your real MX hosts, and reads the size of every DKIM key. Zero dependencies.
 
